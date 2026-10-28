@@ -3799,7 +3799,7 @@ def compress_path(input_path: Path) -> Path:
         raise FileNotFoundError(f'Path not found: {input_path}')
     if input_path.is_symlink():
         raise ValueError('Compressing a symbolic link directly is not supported.')
-    output_path = _ask_existing_path(input_path.with_name(input_path.name + '.vg21c'), 'Output file')
+    output_path = _ask_existing_path(input_path.with_suffix('.vg21c'), 'Output file')
     if output_path is None:
         raise InterruptedError('compression cancelled')
     if input_path.is_file():
