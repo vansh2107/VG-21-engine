@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VG-21C v0.24: endgame lossless compressor portfolio.
+"""VG-21C v0.25: bounded-time large-PE fast path.
 
 Combines native VG-21C encoders with optional LZMA and Brotli-assisted
 per-file dictionary candidates. Every candidate is compared by complete
@@ -3053,15 +3053,100 @@ def _direct_brotli_candidate(data: bytes) -> bytes | None:
     return min(candidates, key=len) if candidates else None
 
 
-def compress(data: bytes) -> bytes:
-    """Compress using the VG-21C v0.24 adaptive portfolio.
+def _is_pe_executable(data: bytes) -> bool:
+    """Recognize a standard PE executable by its MZ and PE signatures."""
+    if len(data) < 64 or data[:2] != b"MZ":
+        return False
+    try:
+        pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+    except struct.error:
+        return False
+    # PE headers normally occur near the beginning; bound the offset to avoid
+    # treating malformed data as a PE file or doing unnecessary work.
+    return 64 <= pe_offset <= min(len(data) - 4, 1 << 20) and data[pe_offset:pe_offset + 4] == b"PE\0\0"
 
-    The format uses a short magic only for compressed data. Raw data is returned
+
+def _sample_entropy(data: bytes) -> float:
+    """Estimate byte entropy from a small sample; used only as a fast heuristic."""
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for value in data:
+        counts[value] += 1
+    import math
+    n = len(data)
+    return -sum((count / n) * math.log2(count / n) for count in counts if count)
+
+
+def _fast_large_pe_compress(data: bytes) -> bytes:
+    """Bound runtime for large PE files without changing the stream format.
+
+    Uses a tiny multi-region entropy screen, then raw DEFLATE level 1. Only if
+    that does not provide a useful reduction does it try Brotli quality 1. The
+    result is selected only if the complete framed stream is smaller; otherwise
+    the original bytes are returned (escaped if required).
+    """
+    n = len(data)
+    raw = RAW_ESCAPE + data if data.startswith(COMPRESSED_MAGICS + (RAW_ESCAPE, MAGIC)) else data
+
+    # A few tiny samples spread over the file avoid a full expensive search on
+    # packed/already-compressed executables. This is a speed heuristic, not a
+    # proof of incompressibility. Returning raw is always lossless.
+    sample_size = 4096
+    offsets = sorted({0, max(0, n // 4 - sample_size // 2),
+                      max(0, n // 2 - sample_size // 2),
+                      max(0, (3 * n) // 4 - sample_size // 2),
+                      max(0, n - sample_size)})
+    entropies = [_sample_entropy(data[o:o + sample_size]) for o in offsets]
+    if entropies and all(value >= 7.90 for value in entropies):
+        return raw
+
+    crc = struct.pack('<I', zlib.crc32(data))
+    try:
+        co = zlib.compressobj(1, zlib.DEFLATED, -15)
+        packed = co.compress(data) + co.flush()
+        candidate = ZLIB_MAGIC + put_varint(n) + packed + crc
+        # Prefer a quick, worthwhile result rather than spending more time
+        # hunting for marginal improvements on an ~825 MiB executable.
+        if len(candidate) <= len(raw) * 0.99:
+            return candidate
+    except (OSError, ValueError, zlib.error, MemoryError):
+        candidate = None
+
+    # Low-quality Brotli is a bounded-speed fallback, not Q11. It uses the same
+    # DIRECT_BROTLI_MAGIC decoder already supported by prior VG-21C releases.
+    if _brotli is not None:
+        try:
+            packed = _brotli.compress(data, quality=1, mode=_brotli.MODE_GENERIC, lgwin=22)
+            brotli_candidate = DIRECT_BROTLI_MAGIC + packed + crc
+            if len(brotli_candidate) < len(raw):
+                if candidate is None or len(brotli_candidate) < len(candidate):
+                    candidate = brotli_candidate
+        except (ValueError, RuntimeError, TypeError, MemoryError):
+            pass
+
+    if candidate is not None and len(candidate) < len(raw):
+        return candidate
+    return raw
+
+
+def compress(data: bytes) -> bytes:
+    """Compress using the VG-21C v0.25 adaptive portfolio.
+
+    Large PE executables (>=64 MiB) use a bounded-time fast path; other inputs
+    retain the v0.24 candidate portfolio. The format uses existing markers. Raw data is returned
     unchanged unless it begins with a reserved marker, in which case RAW_ESCAPE
     makes decoding unambiguous. CRC32 is included on compressed streams.
     """
     if not data:
         return data
+
+    # v0.25: large PE executables use a bounded-time path. This is deliberately
+    # narrow: smaller files and every non-PE input retain the v0.24 search path.
+    # The output markers are existing v0.24 modes, so the decoder format stays
+    # backward-compatible. Compression level is intentionally faster than Q11.
+    if len(data) >= 64 * 1024 * 1024 and _is_pe_executable(data):
+        return _fast_large_pe_compress(data)
 
     # v0.24 endgame fast-path: don't spend minutes running heavyweight codecs
     # on obvious already-compressed/high-entropy data. For ZIP-based containers,
@@ -3774,7 +3859,7 @@ def decompress_path(input_path: Path) -> Path:
 
 def main():
     print('=' * 58)
-    print(' VG-21C v0.21 — Interactive File & Folder Compressor')
+    print(' VG-21C v0.25 — Interactive File & Folder Compressor')
     print('=' * 58)
     print('1. Compress a file or folder')
     print('2. Decompress a .vg21c file')
