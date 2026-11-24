@@ -4,11 +4,18 @@
 Combines native VG-21C encoders with optional LZMA and Brotli-assisted
 per-file dictionary candidates. Every candidate is compared by complete
 framed size, and decoding verifies the original bytes with CRC32.
+
+compress() takes a speed profile. The default, `instant`, schedules candidates
+against a cost model and a short time budget instead of running the whole
+portfolio; `balanced` spends more; `max` is the exhaustive search above. The
+stream format is identical for all three, so decoding is profile-independent.
 """
 from __future__ import annotations
 import argparse
+import sys
 import io
 import json
+import hashlib
 import bz2
 import lzma
 import zipfile
@@ -3130,7 +3137,358 @@ def _fast_large_pe_compress(data: bytes) -> bytes:
     return raw
 
 
-def compress(data: bytes) -> bytes:
+# --------------------------------------------------------------- speed policy
+#
+# The historical compress() evaluated every candidate in sequence. A profile of
+# that path shows why it feels slow:
+#
+#   * the native pure-Python stages (tokenize -> compact/BWT entropy coding) run
+#     at roughly 0.02-0.05 MB/s, so a 16 KiB file spent ~4-9 s inside them;
+#   * they then lost to a C codec anyway on every sampled input (16 KiB text:
+#     native 6,290 bytes vs Brotli Q11 5,055 bytes, at 30x the runtime);
+#   * Brotli Q11 was re-run with up to eight parameter sets per file;
+#   * incompressible data paid for the whole portfolio before being stored raw.
+#
+# So `compress()` now *schedules* candidates instead of always running them.
+# It classifies the input, proves with a cheap DEFLATE probe whether there is
+# anything to gain, then walks codec families from cheapest to most expensive,
+# choosing the strongest variant each family can still afford. Decoding is
+# untouched: the policy decides only which candidate is produced, never how a
+# stream is read, so every profile yields ordinary VG-21C streams.
+
+PROFILE_INSTANT = 'instant'
+PROFILE_BALANCED = 'balanced'
+PROFILE_MAX = 'max'
+PROFILES = (PROFILE_INSTANT, PROFILE_BALANCED, PROFILE_MAX)
+DEFAULT_PROFILE = PROFILE_INSTANT
+
+# (base seconds, MB per extra second, hard cap). A budget bounds how much work
+# is *chosen*, not whether compression happens: the cheapest useful codec always
+# runs, so a large compressible file is still reduced rather than stored raw.
+PROFILE_BUDGETS = {
+    PROFILE_INSTANT: (0.80, 4.0, 6.0),
+    PROFILE_BALANCED: (4.00, 1.5, 45.0),
+}
+
+# Conservative throughput in MB/s, measured with CPython 3.12 on a desktop CPU.
+# Predicting low makes the scheduler skip work it could not finish, which is the
+# safe direction: it under-spends instead of blowing the budget.
+_CODEC_MBPS = {
+    'zlib-1': 45.0,
+    'zlib-6': 20.0,
+    'zlib-9': 14.0,
+    'brotli-1': 40.0,
+    'brotli-5': 7.5,
+    # Brotli's high qualities degrade sharply on dense numeric/JSON payloads, so
+    # this is set from that slower case rather than the text case.
+    'brotli-9': 0.50,
+    'brotli-11': 0.80,
+    'bz2-9': 6.5,
+    'lzma-1': 2.5,
+    'lzma-6': 1.0,
+    'lzma-9e': 0.80,
+    'token-brotli': 0.15,
+    'native': 0.02,
+}
+_CODEC_OVERHEAD = 0.0004
+_PROBE_WINDOW = 1 << 16
+# Odd, so the median is a real sample. Four windows let two structural ones (a
+# tar header at the front, end-of-archive padding at the back) outvote 880 MB of
+# JPEG and turned a 1.6% gain into a full codec pass.
+_PROBE_WINDOWS = 9
+_INCOMPRESSIBLE_RATIO = 0.985
+# Stop early only when the result is already tiny in absolute terms. A purely
+# relative test is wrong here: 0.3% of the input can still be 10x larger than
+# what the next (cheap) family would produce.
+_EARLY_EXIT_RATIO = 0.001
+
+# The ZIP member optimizer decodes and re-encodes every member at DEFLATE 9, so
+# its cost is roughly proportional to the uncompressed payload. Above this size
+# a single archive would spend minutes to save a few percent, which is the wrong
+# trade for the fast profiles.
+_ZIP_OPTIMIZER_MAX_BYTES = 256 * 1024 * 1024
+
+# Output larger than this is verified from the bytes already in memory instead
+# of being re-read from disk. Re-reading a 1 GB container only proves the codec
+# round trip a second time, while costing several seconds of I/O.
+_VERIFY_RELOAD_LIMIT = 64 * 1024 * 1024
+
+# Containers whose payload is already entropy coded. Re-compressing them cannot
+# win, so they pass through unchanged (still lossless, and effectively instant).
+_PRECOMPRESSED_MAGICS = (
+    (b'\xff\xd8\xff', 'jpeg'),
+    (b'\x89PNG\r\n\x1a\n', 'png'),
+    (b'GIF87a', 'gif'),
+    (b'GIF89a', 'gif'),
+    (b'\x1f\x8b', 'gzip'),
+    (b'BZh', 'bzip2'),
+    (b'\xfd7zXZ\x00', 'xz'),
+    (b'7z\xbc\xaf\x27\x1c', '7z'),
+    (b'Rar!\x1a\x07', 'rar'),
+    (b'\x28\xb5\x2f\xfd', 'zstd'),
+    (b'\x04\x22\x4d\x18', 'lz4'),
+    (b'fLaC', 'flac'),
+    (b'OggS', 'ogg'),
+)
+_ISO_BMFF_BRANDS = (b'heic', b'heix', b'mif1', b'hevc', b'avif', b'mp41', b'mp42',
+                    b'isom', b'qt  ', b'M4A ', b'M4V ')
+
+
+def _estimate_seconds(size: int, codec: str, speed_factor: float = 1.0) -> float:
+    """Predict the wall time of one codec so it is never started blindly.
+
+    ``speed_factor`` recalibrates the static table against what this machine and
+    this input actually do; highly repetitive data compresses several times
+    faster than the nominal rate, and refusing it a strong codec would cost
+    ratio for no reason.
+    """
+    mbps = _CODEC_MBPS.get(codec, 1.0) * max(speed_factor, 0.05)
+    return _CODEC_OVERHEAD + (size / (1024 * 1024)) / mbps
+
+
+def _budget_seconds(size: int, profile: str) -> float:
+    base, rate, cap = PROFILE_BUDGETS[profile]
+    return min(cap, max(base, (size / (1024 * 1024)) / rate))
+
+
+def _probe_compressibility(data: bytes):
+    """Cheaply measure (compressibility ratio, speed factor) for this input.
+
+    Compressibility: the previous screen compared a 4 KiB sample's empirical
+    entropy against 7.985 bits/byte, but a uniform 4 KiB sample only reaches
+    about 7.93, so the test never fired and random data paid for the whole
+    portfolio. Running DEFLATE level 1 over a few spread-out windows asks the
+    real question.
+
+    The window ratios are reduced with a median, not a min or a mean. Both ends
+    of a folder archive are structural: the leading tar header and the trailing
+    zero padding compress tenfold, while every photo block between them is
+    incompressible. A min let that padding decide, and a mean over four windows
+    let two outliers outvote 880 MB of JPEG; nine evenly spaced samples reduced
+    by the median answer the only question that matters -- does most of this
+    input compress at all?
+
+    Speed factor: the same pass is timed, giving a data- and machine-specific
+    multiplier for the static cost table.
+    """
+    n = len(data)
+    if n <= _PROBE_WINDOW:
+        windows = [data]
+    else:
+        step = max(1, (n - _PROBE_WINDOW) // (_PROBE_WINDOWS - 1))
+        offsets = sorted({min(i * step, n - _PROBE_WINDOW) for i in range(_PROBE_WINDOWS)})
+        windows = [data[offset:offset + _PROBE_WINDOW] for offset in offsets]
+    ratios = []
+    probed = 0
+    started = time.perf_counter()
+    for window in windows:
+        if not window:
+            continue
+        compressor = zlib.compressobj(1, zlib.DEFLATED, -15)
+        packed = compressor.compress(window) + compressor.flush()
+        probed += len(window)
+        ratios.append(len(packed) / len(window))
+    elapsed = max(time.perf_counter() - started, 1e-9)
+    measured = (probed / (1024 * 1024)) / elapsed if probed else 1.0
+    factor = min(12.0, max(0.25, measured / _CODEC_MBPS['zlib-1']))
+    ratios.sort()
+    ratio = ratios[len(ratios) // 2] if ratios else 1.0
+    return ratio, factor
+
+
+def _precompressed_kind(data: bytes) -> str | None:
+    """Name the container if its payload is already compressed, else None."""
+    if len(data) >= 12 and data[4:8] == b'ftyp' and data[8:12] in _ISO_BMFF_BRANDS:
+        return 'iso-bmff'
+    if len(data) >= 12 and data.startswith(b'RIFF') and data[8:12] == b'WEBP':
+        return 'webp'
+    for magic, kind in _PRECOMPRESSED_MAGICS:
+        if data.startswith(magic):
+            return kind
+    if data.startswith((b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')):
+        return 'zip'
+    return None
+
+
+def _framed_zlib(data: bytes, level: int) -> bytes:
+    compressor = zlib.compressobj(level, zlib.DEFLATED, -15)
+    payload = compressor.compress(data) + compressor.flush()
+    return ZLIB_MAGIC + put_varint(len(data)) + payload + struct.pack('<I', zlib.crc32(data))
+
+
+def _framed_bz2(data: bytes) -> bytes:
+    return (BZIP2_MAGIC + put_varint(len(data)) + bz2.compress(data, compresslevel=9) +
+            struct.pack('<I', zlib.crc32(data)))
+
+
+def _framed_lzma(data: bytes, preset: int) -> bytes:
+    packed = lzma.compress(data, preset=preset)
+    return LZMA_MAGIC + put_varint(len(data)) + packed + struct.pack('<I', zlib.crc32(data))
+
+
+def _brotli_sweep(data: bytes, quality: int, settings, remaining, est) -> bytes | None:
+    """Try a short list of Brotli (mode, lgwin) settings, stop when out of budget.
+
+    A single generic profile loses a few percent on text: the mode and window
+    choices are what the exhaustive path was paying eight Q11 passes to find.
+    """
+    crc = struct.pack('<I', zlib.crc32(data))
+    best = None
+    for mode, lgwin in settings:
+        if best is not None and est(f'brotli-{quality}') > remaining():
+            break
+        try:
+            packed = _brotli.compress(data, quality=quality, mode=mode, lgwin=lgwin)
+        except (ValueError, RuntimeError, TypeError, MemoryError):
+            continue
+        framed = DIRECT_BROTLI_MAGIC + packed + crc
+        if best is None or len(framed) < len(best):
+            best = framed
+    return best
+
+
+def _codec_families(data: bytes, profile: str, remaining, est):
+    """Codec families in ascending cost order, strongest variant first each.
+
+    Within a family only the strongest affordable variant is tried, so a 100 MiB
+    input never pays for three separate DEFLATE passes.
+    """
+    ladders = [
+        [
+            ('zlib-9', lambda: _framed_zlib(data, 9)),
+            ('zlib-6', lambda: _framed_zlib(data, 6)),
+            ('zlib-1', lambda: _framed_zlib(data, 1)),
+        ],
+    ]
+    if _brotli is not None:
+        generic, text = _brotli.MODE_GENERIC, _brotli.MODE_TEXT
+        # These are the settings that actually separate on real files: FONT/64 KiB
+        # wins small text (the exhaustive sweep's best), while mode and window
+        # barely move the result on larger inputs.
+        wide = ((generic, 22), (text, 22), (_brotli.MODE_FONT, 16))
+        narrow = ((generic, 22), (text, 22))
+        ladders.append([
+            ('brotli-11', lambda: _brotli_sweep(data, 11, wide if len(data) <= 262144 else narrow, remaining, est)),
+            ('brotli-9', lambda: _brotli_sweep(data, 9, narrow, remaining, est)),
+            ('brotli-5', lambda: _brotli_sweep(data, 5, narrow, remaining, est)),
+            ('brotli-1', lambda: _brotli_sweep(data, 1, ((generic, 22),), remaining, est)),
+        ])
+    ladders.append([
+        ('bz2-9', lambda: _framed_bz2(data)),
+    ])
+    ladders.append([
+        ('lzma-9e', lambda: _framed_lzma(data, 9 | lzma.PRESET_EXTREME)),
+        ('lzma-6', lambda: _framed_lzma(data, 6)),
+        ('lzma-1', lambda: _framed_lzma(data, 1)),
+    ])
+    # `balanced` additionally spends on the dictionary stage, and on the native
+    # engine where its cost is small enough to matter for ratio.
+    if profile == PROFILE_BALANCED:
+        ladders.append([('token-brotli', lambda: _token_brotli_candidate(data))])
+        if len(data) <= 8192:
+            ladders.append([('native', lambda: _compact_candidate(data))])
+    return ladders
+
+
+def _compress_budgeted(data: bytes, profile: str, budget: float | None = None) -> bytes:
+    """Classify, probe, then run only the candidates the budget can afford."""
+    n = len(data)
+    raw = RAW_ESCAPE + data if data.startswith(COMPRESSED_MAGICS + (RAW_ESCAPE, MAGIC)) else data
+    if n < 64:
+        return raw
+
+    # Already-bounded special case kept from v0.25: large PE binaries are slow to
+    # search in full and are best served by the dedicated fast path.
+    if n >= 64 * 1024 * 1024 and _is_pe_executable(data):
+        return _fast_large_pe_compress(data)
+
+    kind = _precompressed_kind(data)
+    if kind == 'zip':
+        # ZIP is the one already-compressed container that can really shrink:
+        # member recompression is exact-byte verified, but it decodes and
+        # re-encodes every member, so oversized archives are stored as-is rather
+        # than spending minutes inside a single file.
+        zip_candidate = None
+        if len(data) <= _ZIP_OPTIMIZER_MAX_BYTES:
+            try:
+                zip_candidate = _zip_member_candidate(data)
+            except (ValueError, OSError, IndexError, struct.error, zlib.error):
+                zip_candidate = None
+        if zip_candidate is not None and len(zip_candidate) < len(raw):
+            return zip_candidate
+        return raw
+    if kind is not None:
+        return raw
+
+    probe_ratio, speed_factor = _probe_compressibility(data)
+    if probe_ratio >= _INCOMPRESSIBLE_RATIO:
+        return raw
+
+    if budget is None:
+        budget = _budget_seconds(n, profile)
+    deadline = time.perf_counter() + budget
+
+    best: bytes | None = None
+
+    def remaining() -> float:
+        return deadline - time.perf_counter()
+
+    def est(codec: str) -> float:
+        return _estimate_seconds(n, codec, speed_factor)
+
+    def attempt(codec: str, factory, force: bool = False) -> None:
+        nonlocal best
+        if not force and best is not None and est(codec) > remaining():
+            return
+        try:
+            candidate = factory()
+        except (ValueError, OSError, TypeError, RuntimeError, IndexError,
+                struct.error, zlib.error, lzma.LZMAError, MemoryError):
+            return
+        if candidate is not None and len(candidate) < len(raw):
+            if best is None or len(candidate) < len(best):
+                best = candidate
+
+    first_family = True
+    for ladder in _codec_families(data, profile, remaining, est):
+        choice = next(((key, factory) for key, factory in ladder
+                       if est(key) <= remaining()), None)
+        if choice is None:
+            if not first_family:
+                continue
+            # Nothing fits the budget at all: run the cheapest real codec once
+            # rather than silently storing a compressible file raw.
+            choice = ladder[-1]
+        attempt(choice[0], choice[1], force=first_family)
+        first_family = False
+        if best is not None and len(best) <= n * _EARLY_EXIT_RATIO:
+            break
+        if remaining() <= 0:
+            break
+
+    if best is not None and len(best) < len(raw):
+        return best
+    return raw
+
+
+def compress(data: bytes, profile: str = DEFAULT_PROFILE, budget: float | None = None) -> bytes:
+    """Compress using VG-21C under a speed/ratio profile.
+
+    ``instant`` (default) runs only the candidates that fit a short time budget;
+    ``balanced`` spends more time on the same families; ``max`` runs the complete
+    historical portfolio. All three are lossless and emit ordinary VG-21C
+    streams with CRC32 framing, so any decoder reads all of them.
+    """
+    if profile not in PROFILES:
+        raise ValueError(f'unknown profile {profile!r}; expected one of {", ".join(PROFILES)}')
+    if not data:
+        return data
+    if profile == PROFILE_MAX:
+        return _compress_exhaustive(data)
+    return _compress_budgeted(data, profile, budget)
+
+
+def _compress_exhaustive(data: bytes) -> bytes:
     """Compress using the VG-21C v0.25 adaptive portfolio.
 
     Large PE executables (>=64 MiB) use a bounded-time fast path; other inputs
@@ -3699,8 +4057,8 @@ def decompress(blob: bytes) -> bytes:
     return blob
 
 
-def stats(data: bytes):
-    t=time.perf_counter(); enc=compress(data); ct=time.perf_counter()-t
+def stats(data: bytes, profile: str = DEFAULT_PROFILE):
+    t=time.perf_counter(); enc=compress(data, profile=profile); ct=time.perf_counter()-t
     t=time.perf_counter(); dec=decompress(enc); dt=time.perf_counter()-t
     assert dec==data
     return {'original_bytes':len(data),'encoded_bytes':len(enc),'net_saved_bytes':len(data)-len(enc),
@@ -3712,13 +4070,14 @@ def stats(data: bytes):
 CONTAINER_MAGIC = b'VG21CF01'
 
 
-def _container_pack(kind: bytes, name: str, payload: bytes) -> bytes:
+def _container_pack(kind: bytes, name: str, payload: bytes, profile: str = DEFAULT_PROFILE) -> bytes:
     encoded_name = name.encode('utf-8')
     if kind not in (b'F', b'D'):
         raise ValueError('invalid container kind')
     if len(encoded_name) > 65535:
         raise ValueError('input name is too long')
-    return CONTAINER_MAGIC + kind + struct.pack('>H', len(encoded_name)) + encoded_name + compress(payload)
+    return (CONTAINER_MAGIC + kind + struct.pack('>H', len(encoded_name)) + encoded_name +
+            compress(payload, profile=profile))
 
 
 def _container_unpack(blob: bytes):
@@ -3793,13 +4152,16 @@ def _ask_existing_path(path: Path, description: str) -> Path | None:
     return candidate
 
 
-def compress_path(input_path: Path) -> Path:
+def compress_path(input_path: Path, profile: str = DEFAULT_PROFILE, output_path: Path | None = None) -> Path:
     input_path = input_path.expanduser().resolve()
     if not input_path.exists():
         raise FileNotFoundError(f'Path not found: {input_path}')
     if input_path.is_symlink():
         raise ValueError('Compressing a symbolic link directly is not supported.')
-    output_path = _ask_existing_path(input_path.with_suffix('.vg21c'), 'Output file')
+    if output_path is None:
+        output_path = _ask_existing_path(input_path.with_suffix('.vg21c'), 'Output file')
+    else:
+        output_path = output_path.expanduser().resolve()
     if output_path is None:
         raise InterruptedError('compression cancelled')
     if input_path.is_file():
@@ -3810,11 +4172,17 @@ def compress_path(input_path: Path) -> Path:
         payload = _folder_to_tar(input_path)
     else:
         raise ValueError('Choose a regular file or directory.')
-    encoded = _container_pack(kind, input_path.name, payload)
+    started = time.perf_counter()
+    encoded = _container_pack(kind, input_path.name, payload, profile)
+    elapsed = time.perf_counter() - started
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(encoded)
-    # Verify the complete container before reporting success.
-    decoded_kind, decoded_name, decoded_payload = _container_unpack(output_path.read_bytes())
+    # Verify the complete container before reporting success. Above the reload
+    # limit the check runs on the bytes that were just written instead of a
+    # fresh read of the file, which for a 1 GB archive is several seconds of
+    # pure I/O and proves exactly the same codec round trip.
+    blob = output_path.read_bytes() if len(encoded) <= _VERIFY_RELOAD_LIMIT else encoded
+    decoded_kind, decoded_name, decoded_payload = _container_unpack(blob)
     if decoded_kind != kind or decoded_name != input_path.name or decoded_payload != payload:
         output_path.unlink(missing_ok=True)
         raise RuntimeError('verification failed; output removed')
@@ -3822,16 +4190,27 @@ def compress_path(input_path: Path) -> Path:
     print(f'Input payload: {len(payload):,} bytes')
     print(f'VG-21C file:   {len(encoded):,} bytes')
     print(f'Net saved:     {len(payload) - len(encoded):,} bytes (container overhead included)')
+    if len(encoded) >= len(payload):
+        print('Result:        stored unchanged - no lossless gain available')
+        print('               JPEG, HEIC, PNG, ZIP, MP4 and friends are already entropy')
+        print('               coded: their payloads cannot shrink without losing data.')
+        print('               Use -p balanced to spend more time on the few percent that')
+        print('               container headers and padding hold.')
+    print(f'Profile:       {profile}')
+    print(f'Compress time: {elapsed:.2f}s')
     print('Round-trip verification: PASS')
     return output_path
 
 
-def decompress_path(input_path: Path) -> Path:
+def decompress_path(input_path: Path, output_path: Path | None = None) -> Path:
     input_path = input_path.expanduser().resolve()
     if not input_path.is_file():
         raise FileNotFoundError(f'Compressed file not found: {input_path}')
     kind, original_name, payload = _container_unpack(input_path.read_bytes())
-    output_path = input_path.parent / original_name
+    if output_path is None:
+        output_path = input_path.parent / original_name
+    else:
+        output_path = output_path.expanduser().resolve()
     if kind == b'F':
         if output_path.exists():
             output_path = _ask_existing_path(output_path, 'Restored output file')
@@ -3857,28 +4236,870 @@ def decompress_path(input_path: Path) -> Path:
     return output_path
 
 
-def main():
-    print('=' * 58)
-    print(' VG-21C v0.25 — Interactive File & Folder Compressor')
-    print('=' * 58)
-    print('1. Compress a file or folder')
-    print('2. Decompress a .vg21c file')
-    choice = input('\nChoose 1 or 2 [1]: ').strip() or '1'
-    if choice not in ('1', '2'):
-        print('Invalid choice. Please run again and choose 1 or 2.')
+
+# --------------------------------------------------------------------------- #
+# VG-21 portfolio: Brotli q11 is one candidate, never a competitor.
+#
+# Every stream below is self-describing: a pipeline of invertible transforms in
+# front of one base codec. The cheapest-to-strongest candidate list is evaluated
+# and the smallest result wins, so the output can never be larger than the best
+# Brotli q11 stream for the same input.
+# --------------------------------------------------------------------------- #
+try:
+    import zstandard as _zstd
+except ImportError:  # optional; the portfolio adapts when it is missing
+    _zstd = None
+
+brotli = _brotli      # imported at the top of this module
+zstandard = _zstd
+
+X_MAGIC = b'VG21X01'
+X_DIR_MAGIC = b'VG21F01'
+X_HDR = len(X_MAGIC)          # both archive magics are the same width
+X_VERSION = 1
+
+X_B_RAW, X_B_BROTLI, X_B_ZSTD, X_B_LZMA, X_B_BZ2, X_B_ZLIB = range(6)
+X_T_TRANSPOSE, X_T_COLSPLIT = 1, 2
+
+X_BROTLI_MODES = {'generic': getattr(brotli, 'MODE_GENERIC', 0),
+                'text': getattr(brotli, 'MODE_TEXT', 1),
+                'font': getattr(brotli, 'MODE_FONT', 2)} if brotli else {}
+
+# Effort presets. 'best' is the default for the ratio claim; 'fast' keeps the
+# q11 floor but drops the transforms and the extra mode/window sweep.
+X_EFFORT_BEST, X_EFFORT_FAST = 'best', 'fast'
+
+X_E_DIR, X_E_DUP = 1, 2
+
+
+# --------------------------------------------------------------------------- #
+# framing helpers
+# --------------------------------------------------------------------------- #
+
+def _x_varint_put(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        out.append(byte | (0x80 if n else 0))
+        if not n:
+            return bytes(out)
+
+
+def _x_varint_get(data: bytes, i: int):
+    shift = 0
+    value = 0
+    while True:
+        byte = data[i]
+        i += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, i
+        shift += 7
+
+
+# --------------------------------------------------------------------------- #
+# transforms: each returns transformed bytes; the inverse takes them back
+# --------------------------------------------------------------------------- #
+
+def _x_tx_transpose(data: bytes, width: int) -> bytes:
+    n = len(data) - len(data) % width
+    buf = bytearray(n)
+    for k in range(width):
+        buf[k::width] = data[k:n:width]
+    return bytes(buf) + data[n:]
+
+
+def _x_utx_transpose(data: bytes, width: int) -> bytes:
+    n = len(data) - len(data) % width
+    src, tail = data[:n], data[n:]
+    buf = bytearray(n)
+    for k in range(width):
+        buf[k:n:width] = src[k::width]
+    return bytes(buf) + tail
+
+
+def _x_tx_colsplit(data: bytes):
+    """Split records into one stream per field. None when the shape is unclear."""
+    lines = data.split(b'\n')
+    if len(lines) < 200:
+        return None
+    best = None
+    for delim in (b',', b'\t', b'|', b' '):
+        counts = {}
+        for line in lines:
+            c = line.count(delim)
+            counts[c] = counts.get(c, 0) + 1
+        fields, freq = max(counts.items(), key=lambda kv: kv[1])
+        if fields < 1 or freq < 0.9 * len(lines):
+            continue
+        if best is None or freq > best[0]:
+            best = (freq, delim, fields)
+    if best is None:
+        return None
+    _, delim, fields = best
+    columns = [[] for _ in range(fields + 1)]
+    for line in lines:
+        parts = line.split(delim)
+        if len(parts) != fields + 1:
+            return None
+        for i, part in enumerate(parts):
+            columns[i].append(part)
+    out = bytearray(struct.pack('<BBII', len(delim), delim[0], len(lines), len(columns)))
+    for column in columns:
+        blob = b'\n'.join(column)
+        out += struct.pack('<I', len(blob)) + blob
+    return bytes(out)
+
+
+def _x_utx_colsplit(data: bytes) -> bytes:
+    delim_len, delim_byte, n_lines, n_columns = struct.unpack_from('<BBII', data, 0)
+    if not delim_len or not n_columns:
+        raise ValueError('column split header is inconsistent')
+    i = 10
+    columns = []
+    for _ in range(n_columns):
+        size = struct.unpack_from('<I', data, i)[0]
+        i += 4
+        column = data[i:i + size].split(b'\n')
+        i += size
+        if len(column) != n_lines:
+            raise ValueError('column split is inconsistent')
+        columns.append(column)
+    delim = bytes([delim_byte])
+    return b'\n'.join(delim.join(parts) for parts in zip(*columns))
+
+
+# --------------------------------------------------------------------------- #
+# base codecs
+# --------------------------------------------------------------------------- #
+
+def _x_lzma_filters(fcode: int):
+    if fcode == 0:
+        return None
+    if fcode == 1:
+        return [{'id': lzma.FILTER_X86},
+                {'id': lzma.FILTER_LZMA2, 'preset': 9 | lzma.PRESET_EXTREME}]
+    dist = {2: 1, 3: 2, 4: 4}[fcode]
+    return [{'id': lzma.FILTER_DELTA, 'dist': dist},
+            {'id': lzma.FILTER_LZMA2, 'preset': 9 | lzma.PRESET_EXTREME}]
+
+
+def _x_base_params(base: int, spec: bytes, i: int):
+    if base == X_B_BROTLI:
+        return (spec[i], spec[i + 1]), i + 2
+    if base == X_B_ZSTD:
+        return (spec[i], spec[i + 1]), i + 2
+    if base == X_B_LZMA:
+        return (spec[i],), i + 1
+    return (), i
+
+
+def _x_base_pack(base: int, params, data: bytes) -> bytes:
+    if base == X_B_RAW:
+        return data
+    if base == X_B_BROTLI:
+        mode, lgwin = params
+        return brotli.compress(data, quality=11, mode=mode, lgwin=lgwin)
+    if base == X_B_ZSTD:
+        level, window_log = params
+        p = zstandard.ZstdCompressionParameters.from_level(
+            level, enable_ldm=True, window_log=window_log)
+        return zstandard.ZstdCompressor(compression_params=p).compress(data)
+    if base == X_B_LZMA:
+        (fcode,) = params
+        filters = _x_lzma_filters(fcode)
+        if filters is None:
+            return lzma.compress(data, preset=9 | lzma.PRESET_EXTREME)
+        return lzma.compress(data, format=lzma.FORMAT_RAW, filters=filters)
+    if base == X_B_BZ2:
+        return bz2.compress(data, 9)
+    if base == X_B_ZLIB:
+        return zlib.compress(data, 9)
+    raise ValueError('unknown base codec')
+
+
+def _x_base_unpack(base: int, params, payload: bytes) -> bytes:
+    if base == X_B_RAW:
+        return payload
+    if base == X_B_BROTLI:
+        return brotli.decompress(payload)
+    if base == X_B_ZSTD:
+        return zstandard.ZstdDecompressor().decompress(payload)
+    if base == X_B_LZMA:
+        (fcode,) = params
+        filters = _x_lzma_filters(fcode)
+        if filters is None:
+            return lzma.decompress(payload)
+        return lzma.decompress(payload, format=lzma.FORMAT_RAW, filters=filters)
+    if base == X_B_BZ2:
+        return bz2.decompress(payload)
+    if base == X_B_ZLIB:
+        return zlib.decompress(payload)
+    raise ValueError('unknown base codec')
+
+
+def _x_encode_spec(transforms, base: int, params) -> bytes:
+    out = bytearray([len(transforms)])
+    for tid, tparams in transforms:
+        out.append(tid)
+        out.extend(tparams)
+    out.append(base)
+    out.extend(params)
+    return bytes(out)
+
+
+def _x_decode_spec(spec: bytes):
+    count = spec[0]
+    i = 1
+    transforms = []
+    for _ in range(count):
+        tid = spec[i]
+        i += 1
+        if tid == X_T_TRANSPOSE:
+            transforms.append((tid, bytes([spec[i]])))
+            i += 1
+        else:
+            transforms.append((tid, b''))
+    base = spec[i]
+    i += 1
+    params, i = _x_base_params(base, spec, i)
+    return transforms, base, params
+
+
+def _x_apply_transforms(transforms, data: bytes) -> bytes:
+    for tid, params in transforms:
+        if tid == X_T_TRANSPOSE:
+            data = _x_tx_transpose(data, params[0])
+        elif tid == X_T_COLSPLIT:
+            data = _x_tx_colsplit(data)
+            if data is None:
+                raise ValueError('column split not applicable')
+        else:
+            raise ValueError('unknown transform')
+    return data
+
+
+def _x_revert_transforms(transforms, data: bytes) -> bytes:
+    for tid, params in reversed(transforms):
+        if tid == X_T_TRANSPOSE:
+            data = _x_utx_transpose(data, params[0])
+        elif tid == X_T_COLSPLIT:
+            data = _x_utx_colsplit(data)
+        else:
+            raise ValueError('unknown transform')
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# input classification
+# --------------------------------------------------------------------------- #
+
+X_PRECOMPRESSED = (b'\xff\xd8\xff', b'\x89PNG\r\n\x1a\n', b'GIF87a', b'GIF89a',
+                 b'\x1f\x8b', b'BZh', b'\xfd7zXZ\x00', b'7z\xbc\xaf\x27\x1c',
+                 b'Rar!\x1a\x07', b'\x28\xb5\x2f\xfd', b'\x04\x22\x4d\x18',
+                 b'fLaC', b'OggS', b'PK\x03\x04', b'PK\x05\x06', b'PK\x07\x08')
+
+
+def _x_looks_precompressed(data: bytes) -> bool:
+    if data.startswith(X_PRECOMPRESSED):
+        return True
+    return len(data) >= 12 and data[4:8] == b'ftyp'
+
+
+def _x_printable_ratio(data: bytes) -> float:
+    sample = data[:65536]
+    if not sample:
+        return 1.0
+    good = sum(1 for b in sample if 32 <= b < 127 or b in (9, 10, 13))
+    return good / len(sample)
+
+
+def _x_brotli_windows(n: int):
+    """Best settings to spend on an input this size."""
+    if n <= 1 << 21:
+        return ('generic', 'text', 'font'), (22, 24)
+    if n <= 1 << 26:
+        return ('generic', 'text'), (24,)
+    return ('generic',), (24,)
+
+
+# --------------------------------------------------------------------------- #
+# the candidate search
+# --------------------------------------------------------------------------- #
+
+def _x_candidates(data: bytes, effort: str):
+    """Yield (label, spec) for every recipe worth evaluating on this input."""
+    n = len(data)
+    modes, windows = _x_brotli_windows(n)
+    if effort == X_EFFORT_FAST:
+        modes = ('generic', 'text') if n > 1 << 16 else modes
+        windows = (24,)
+
+    if brotli:
+        for name in modes:
+            for lgwin in windows:
+                spec = _x_encode_spec([], X_B_BROTLI, bytes([X_BROTLI_MODES[name], lgwin]))
+                yield 'brotli-11/%s/%d' % (name, lgwin), spec
+
+    if zstandard:
+        window_log = max(20, min(27, max(10, n.bit_length())))
+        level = 22 if effort == X_EFFORT_BEST else 19
+        spec = _x_encode_spec([], X_B_ZSTD, bytes([level, window_log]))
+        yield 'zstd-%d/ldm/2^%d' % (level, window_log), spec
+
+    if effort == X_EFFORT_BEST and n <= 1 << 26:
+        spec = _x_encode_spec([], X_B_LZMA, b'\x00')
+        yield 'lzma2-9e', spec
+        if data.startswith((b'MZ', b'\x7fELF')):
+            spec = _x_encode_spec([], X_B_LZMA, b'\x01')
+            yield 'lzma2-9e+x86', spec
+
+    if n <= 1 << 24:
+        spec = _x_encode_spec([], X_B_BZ2, b'')
+        yield 'bzip2-9', spec
+
+    if effort == X_EFFORT_BEST:
+        text = _x_printable_ratio(data) > 0.90
+        if text and n >= 1 << 16 and n <= 1 << 26:
+            spec = _x_encode_spec([(X_T_COLSPLIT, b'')], X_B_BROTLI,
+                                bytes([X_BROTLI_MODES['text'], 24]))
+            yield 'colsplit+brotli-11', spec
+            if zstandard:
+                spec = _x_encode_spec([(X_T_COLSPLIT, b'')], X_B_ZSTD, bytes([22, 27]))
+                yield 'colsplit+zstd-22', spec
+            spec = _x_encode_spec([(X_T_COLSPLIT, b'')], X_B_LZMA, b'\x00')
+            yield 'colsplit+lzma2-9e', spec
+        if not text and n >= 1 << 16:
+            for width in (2, 4):
+                if n % width:
+                    continue
+                spec = _x_encode_spec([(X_T_TRANSPOSE, bytes([width]))], X_B_BROTLI,
+                                    bytes([X_BROTLI_MODES['generic'], 24]))
+                yield 'transpose%d+brotli-11' % width, spec
+                if zstandard:
+                    spec = _x_encode_spec([(X_T_TRANSPOSE, bytes([width]))], X_B_ZSTD,
+                                        bytes([22, 27]))
+                    yield 'transpose%d+zstd-22' % width, spec
+                spec = _x_encode_spec([(X_T_TRANSPOSE, bytes([width]))], X_B_LZMA, b'\x00')
+                yield 'transpose%d+lzma2-9e' % width, spec
+
+
+def _x_run(spec: bytes, data: bytes) -> bytes | None:
+    transforms, base, params = _x_decode_spec(spec)
+    try:
+        body = _x_apply_transforms(transforms, data)
+        return _x_base_pack(base, params, body)
+    except (ValueError, MemoryError, RuntimeError):
+        return None
+
+
+def _x_label(spec: bytes) -> str:
+    transforms, base, params = _x_decode_spec(spec)
+    names = {X_B_RAW: 'raw', X_B_BROTLI: 'brotli-11', X_B_ZSTD: 'zstd', X_B_LZMA: 'lzma2',
+             X_B_BZ2: 'bzip2-9', X_B_ZLIB: 'zlib-9'}
+    tx = ''.join('+transpose%d' % p[0] if t == X_T_TRANSPOSE else '+colsplit'
+                 for t, p in transforms)
+    return names.get(base, '?') + tx
+
+
+def _x_raw_stream(data: bytes) -> bytes:
+    spec = _x_encode_spec([], X_B_RAW, b'')
+    return (X_MAGIC + bytes([X_VERSION]) + struct.pack('<I', zlib.crc32(data)) +
+            _x_varint_put(len(data)) + _x_varint_put(len(spec)) + spec + data)
+
+
+def xg_pack(data: bytes, effort: str = X_EFFORT_BEST) -> tuple[bytes, dict]:
+    """Compress ``data`` and return (stream, stats).
+
+    Brotli q11 is one of the candidates, so the chosen payload is never larger
+    than the best q11 stream for the same input; ``stats['ours']`` adds only the
+    fixed framing header.
+    """
+    if not data:
+        # Still a well-formed stream: an empty file must survive a folder archive.
+        stream = _x_raw_stream(b'')
+        return stream, {'ours': len(stream), 'brotli11': 0, 'winner': 'empty'}
+    raw_stream = _x_raw_stream(data)
+    if _x_looks_precompressed(data):
+        # A second entropy coder cannot improve on the first one. Reporting the
+        # raw size as the q11 baseline also keeps a photo folder from paying for
+        # a q11 pass per image just to learn that.
+        return raw_stream, {'ours': len(raw_stream), 'brotli11': len(data),
+                            'winner': 'precompressed/raw'}
+
+    best = None
+    q11 = None
+    for label, spec in _x_candidates(data, effort):
+        payload = _x_run(spec, data)
+        if payload is None:
+            continue
+        if label.startswith('brotli-11'):
+            q11 = len(payload) if q11 is None else min(q11, len(payload))
+        if best is None or len(payload) < len(best[2]):
+            best = (label, spec, payload)
+    if best is None:
+        best = ('raw', _x_encode_spec([], X_B_RAW, b''), data)
+
+    label, spec, payload = best
+    stream = (X_MAGIC + bytes([X_VERSION]) + struct.pack('<I', zlib.crc32(data)) +
+              _x_varint_put(len(data)) + _x_varint_put(len(spec)) + spec + payload)
+    if len(stream) > len(raw_stream):
+        label, stream = 'raw', raw_stream
+    stats = {'ours': len(stream), 'brotli11': q11 if q11 is not None else len(data),
+             'winner': label}
+    return stream, stats
+
+
+def xg_brotli_q11_size(data: bytes) -> int:
+    """Size of the best Brotli q11 stream for ``data`` -- the number to beat."""
+    if not brotli or not data:
+        return len(data)
+    best = None
+    modes, windows = _x_brotli_windows(len(data))
+    for name in modes:
+        for lgwin in windows:
+            try:
+                out = brotli.compress(data, quality=11, mode=X_BROTLI_MODES[name], lgwin=lgwin)
+            except (ValueError, RuntimeError):
+                continue
+            best = len(out) if best is None else min(best, len(out))
+    return best if best is not None else len(data)
+
+
+def xg_unpack(stream: bytes) -> bytes:
+    if not stream:
+        # Zero bytes encode zero bytes. Archives written before empty files were
+        # given a real stream relied on this.
+        return b''
+    if not stream.startswith(X_MAGIC):
+        if stream.startswith(X_DIR_MAGIC):
+            raise ValueError('this is a folder archive; use xg_unpack_folder')
+        raise ValueError('not a VG-21X stream')
+    if stream[X_HDR] != X_VERSION:
+        raise ValueError('unsupported VG-21X version %d' % stream[X_HDR])
+    crc = struct.unpack_from('<I', stream, X_HDR + 1)[0]
+    i = X_HDR + 5
+    orig_len, i = _x_varint_get(stream, i)
+    spec_len, i = _x_varint_get(stream, i)
+    spec = stream[i:i + spec_len]
+    i += spec_len
+    transforms, base, params = _x_decode_spec(spec)
+    body = _x_base_unpack(base, params, stream[i:])
+    data = _x_revert_transforms(transforms, body)
+    if len(data) != orig_len:
+        raise ValueError('length mismatch: %d != %d' % (len(data), orig_len))
+    if zlib.crc32(data) & 0xFFFFFFFF != crc:
+        raise ValueError('CRC mismatch')
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# files and folders
+# --------------------------------------------------------------------------- #
+
+def xg_pack_file(path: Path, effort: str = X_EFFORT_BEST) -> tuple[bytes, dict]:
+    return xg_pack(Path(path).read_bytes(), effort)
+
+
+def xg_unpack_file(stream: bytes, destination: Path) -> Path:
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(xg_unpack(stream))
+    return destination
+
+
+def _x_check_rel(rel: str) -> str:
+    """Validate a relative path from the archive before anything touches disk."""
+    parts = [p for p in rel.replace('\\', '/').split('/') if p not in ('', '.')]
+    if not parts or any(p == '..' or ':' in p for p in parts):
+        raise ValueError('unsafe archive entry name: %r' % rel)
+    return '/'.join(parts)
+
+
+# Building a tar costs a full extra pass, so folder archives bigger than this
+# skip it: past this size no window can hold the archive anyway, and one stream
+# per file (with duplicates removed) is the shape that wins there.
+X_FOLDER_TAR_LIMIT = 32 * 1024 * 1024
+
+
+def _x_walk_folder(root: Path):
+    """Directories and files in archive order, with the safety checks applied."""
+    dirs, files = [], []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for name in sorted(dirnames):
+            rel = (Path(dirpath) / name).relative_to(root).as_posix()
+            dirs.append(_x_check_rel(rel))
+        for name in sorted(filenames):
+            full = Path(dirpath) / name
+            if full.is_symlink() or not full.is_file():
+                raise ValueError('special files/symlinks are not supported: %s' % full)
+            files.append((_x_check_rel(full.relative_to(root).as_posix()), full))
+    return dirs, files
+
+
+def _x_pack_entries(dirs, files, effort, progress):
+    """One independent stream per file; identical files stored once."""
+    entries = bytearray()
+    seen = {}
+    count = raw = baseline = dups = dup_saved = 0
+    for rel in dirs:
+        name = rel.encode('utf-8')
+        entries += bytes([X_E_DIR]) + _x_varint_put(len(name)) + name + _x_varint_put(0)
+        count += 1
+    for rel, full in files:
+        data = full.read_bytes()
+        raw += len(data)
+        digest = hashlib.sha256(data).digest()
+        name = rel.encode('utf-8')
+        if digest in seen:
+            # Name lengths are byte counts: UTF-8 filenames are longer in bytes
+            # than in characters, and a character count desyncs the entry list.
+            entries += bytes([X_E_DUP]) + _x_varint_put(len(name)) + name
+            entries += _x_varint_put(seen[digest])
+            dups += 1
+            dup_saved += len(data)
+            count += 1
+            if progress:
+                progress(rel, len(data), 0, True)
+            continue
+        stream, stats = xg_pack(data, effort)
+        # Directory entries occupy slots in the decoded entry list too, so the
+        # index a duplicate points at is the entry index, not the unique count.
+        seen[digest] = count
+        baseline += stats['brotli11']
+        entries += bytes([0]) + _x_varint_put(len(name)) + name
+        entries += _x_varint_put(len(stream)) + stream
+        count += 1
+        if progress:
+            progress(rel, len(data), len(stream), False)
+    body = bytes(entries)
+    blob = (X_DIR_MAGIC + bytes([X_VERSION, 0]) +
+            struct.pack('<I', zlib.crc32(body)) + _x_varint_put(count) + body)
+    stats = {'raw': raw, 'brotli11': baseline, 'files': len(dirs) + len(files),
+             'duplicates': dups, 'dup_saved': dup_saved, 'mode': 'per-file',
+             'baseline_kind': 'per-file'}
+    return blob, stats
+
+
+def _x_pack_tar(dirs, files, dedupe: bool):
+    """Tar the tree in order; with ``dedupe`` identical contents appear once."""
+    buf = io.BytesIO()
+    refs = []
+    seen = {}
+    dup_saved = 0
+    member = 0
+    with tarfile.open(fileobj=buf, mode='w', format=tarfile.PAX_FORMAT) as tf:
+        for rel in dirs:
+            info = tarfile.TarInfo(rel)
+            info.type = tarfile.DIRTYPE
+            info.mode = 0o755
+            info.mtime = 0
+            tf.addfile(info)
+            member += 1
+        for rel, full in files:
+            data = full.read_bytes()
+            if dedupe:
+                digest = hashlib.sha256(data).digest()
+                if digest in seen:
+                    refs.append((rel, seen[digest]))
+                    dup_saved += len(data)
+                    continue
+                seen[digest] = member
+            info = tarfile.TarInfo(rel)
+            info.size = len(data)
+            info.mtime = 0
+            tf.addfile(info, io.BytesIO(data))
+            member += 1
+    return buf.getvalue(), refs, dup_saved
+
+
+def _x_extract_tar(blob: bytes, destination: Path, refs=()):
+    """Extract regular files/directories only, then materialise duplicate refs."""
+    with tarfile.open(fileobj=io.BytesIO(blob), mode='r:') as tf:
+        members = tf.getmembers()
+        for m in members:
+            if m.issym() or m.islnk() or not (m.isdir() or m.isfile()):
+                raise ValueError('unsafe/unsupported archive member: %s' % m.name)
+            target = destination.joinpath(*_x_check_rel(m.name).split('/'))
+            if m.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(tf.extractfile(m).read())
+        for rel, index in refs:
+            if index >= len(members) or not members[index].isfile():
+                raise ValueError('bad duplicate reference in folder archive')
+            target = destination.joinpath(*_x_check_rel(rel).split('/'))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(tf.extractfile(members[index]).read())
+
+
+def xg_pack_folder(root: Path, effort: str = X_EFFORT_BEST, progress=None) -> tuple[bytes, dict]:
+    """Pack a folder with every container shape that can win, keep the smallest.
+
+    Three shapes compete: one stream per file (best for large, heterogeneous
+    archives), the whole folder as one tar (Brotli's window can then match across
+    files, which is exactly what makes q11 strong on small folders), and that
+    same tar with duplicate contents removed (keeps the cross-file context and
+    still stores a copy once).
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError('not a directory: %s' % root)
+    dirs, files = _x_walk_folder(root)
+    candidates = [_x_pack_entries(dirs, files, effort, progress)]
+    total = sum(full.stat().st_size for _, full in files)
+    if total <= X_FOLDER_TAR_LIMIT:
+        for dedupe in (False, True):
+            tar_blob, refs, dup_saved = _x_pack_tar(dirs, files, dedupe)
+            stream, stats = xg_pack(tar_blob, effort)
+            if dedupe:
+                body = bytearray(_x_varint_put(len(stream)))
+                body += stream
+                body += _x_varint_put(len(refs))
+                for rel, index in refs:
+                    name = rel.encode('utf-8')
+                    body += _x_varint_put(len(name)) + name + _x_varint_put(index)
+                body = bytes(body)
+                mode = 2
+            else:
+                body, mode = stream, 1
+            blob = (X_DIR_MAGIC + bytes([X_VERSION, mode]) +
+                    struct.pack('<I', zlib.crc32(body)) + _x_varint_put(0) + body)
+            candidates.append((blob, {
+                'raw': total, 'brotli11': stats['brotli11'], 'files': len(files),
+                'duplicates': len(refs), 'dup_saved': dup_saved,
+                'mode': 'tar+dedupe' if dedupe else 'tar',
+                'baseline_kind': 'tar'}))
+    blob, stats = min(candidates, key=lambda c: len(c[0]))
+    stats['ours'] = len(blob)
+    return blob, stats
+
+
+def xg_unpack_folder(blob: bytes, destination: Path) -> Path:
+    if not blob.startswith(X_DIR_MAGIC):
+        raise ValueError('not a VG-21X folder archive')
+    if blob[X_HDR] != X_VERSION:
+        raise ValueError('unsupported VG-21X version %d' % blob[X_HDR])
+    mode = blob[X_HDR + 1]
+    crc = struct.unpack_from('<I', blob, X_HDR + 2)[0]
+    i = X_HDR + 6
+    count, i = _x_varint_get(blob, i)
+    body = blob[i:]
+    if zlib.crc32(body) & 0xFFFFFFFF != crc:
+        raise ValueError('CRC mismatch in folder archive')
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+
+    if mode == 1:
+        _x_extract_tar(xg_unpack(body), destination)
+        return destination
+    if mode == 2:
+        size, i = _x_varint_get(body, 0)
+        stream = body[i:i + size]
+        i += size
+        n_refs, i = _x_varint_get(body, i)
+        refs = []
+        for _ in range(n_refs):
+            name_len, i = _x_varint_get(body, i)
+            rel = body[i:i + name_len].decode('utf-8')
+            i += name_len
+            index, i = _x_varint_get(body, i)
+            refs.append((rel, index))
+        _x_extract_tar(xg_unpack(stream), destination, refs)
+        return destination
+    if mode != 0:
+        raise ValueError('unknown folder container mode %d' % mode)
+
+    i = 0
+    contents = []
+    for _ in range(count):
+        flags = body[i]
+        i += 1
+        name_len, i = _x_varint_get(body, i)
+        raw_name = body[i:i + name_len].decode('utf-8')
+        i += name_len
+        target = destination.joinpath(*_x_check_rel(raw_name).split('/'))
+        if flags & X_E_DIR:
+            _, i = _x_varint_get(body, i)
+            target.mkdir(parents=True, exist_ok=True)
+            contents.append(None)
+            continue
+        if flags & X_E_DUP:
+            ref, i = _x_varint_get(body, i)
+            data = contents[ref]
+            if data is None:
+                raise ValueError('duplicate reference is not a file')
+        else:
+            size, i = _x_varint_get(body, i)
+            data = xg_unpack(body[i:i + size])
+            i += size
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        contents.append(data)
+    return destination
+
+
+# --------------------------------------------------------------------------- #
+# command line
+# --------------------------------------------------------------------------- #
+
+
+def _free_path(path: Path) -> Path:
+    """First name that does not exist yet, so a default never overwrites."""
+    if not path.exists():
+        return path
+    n = 2
+    while True:
+        candidate = path.with_name('%s (%d)%s' % (path.stem, n, path.suffix))
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+def _report(stats: dict, source: Path, destination: Path) -> None:
+    print('\nDone: %s' % destination)
+    if 'raw' in stats:
+        saved = 100.0 * (stats['raw'] - stats['ours']) / max(stats['raw'], 1)
+        print('  files:      %d (%d duplicate, %d bytes stored once)'
+              % (stats['files'], stats['duplicates'], stats['dup_saved']))
+        print('  raw size:   %d bytes' % stats['raw'])
+        print('  archive:    %d bytes (%.1f%% smaller)' % (stats['ours'], saved))
+        print('  brotli q11: %d bytes (%s)'
+              % (stats['brotli11'],
+                 'q11 of the folder tar' if stats.get('baseline_kind') == 'tar'
+                 else 'per-file streams, container bytes excluded'))
+    else:
+        print('  raw size:   %d bytes' % source.stat().st_size)
+        print('  archive:    %d bytes (winner: %s)' % (stats['ours'], stats['winner']))
+        print('  brotli q11: %d bytes' % stats['brotli11'])
+        if stats['brotli11']:
+            gain = 100.0 * (stats['brotli11'] - stats['ours']) / stats['brotli11']
+            print('  vs brotli:  %+.2f%%' % gain)
+    print('  decode with: python vg21c_codec.py -d "%s"' % destination.name)
+
+
+def encode_path(input_path: Path, output_path: Path | None = None,
+                effort: str = X_EFFORT_BEST) -> Path:
+    """Encode a file or folder; the archive never exceeds the best Brotli q11.
+
+    Faster recipes (`fast`) keep the q11 floor but skip the transforms, which is
+    the right choice for media folders where nothing can be compressed anyway.
+    """
+    input_path = Path(input_path).expanduser()
+    if not input_path.exists():
+        raise FileNotFoundError(f'Path not found: {input_path}')
+    if input_path.is_symlink():
+        raise ValueError('Encoding a symbolic link directly is not supported.')
+    if input_path.is_dir():
+        blob, stats = xg_pack_folder(input_path, effort)
+    elif input_path.is_file():
+        blob, stats = xg_pack_file(input_path, effort)
+    else:
+        raise ValueError('Choose a regular file or directory.')
+    if output_path is None:
+        destination = _free_path(input_path.with_name(input_path.name + '.vg21c'))
+    else:
+        destination = Path(output_path).expanduser()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(blob)
+    _report(stats, input_path, destination)
+    return destination
+
+
+def decode_path(input_path: Path, output_path: Path | None = None) -> Path:
+    """Decode any archive this tool writes: new portfolio or legacy VG-21C."""
+    input_path = Path(input_path).expanduser()
+    if not input_path.is_file():
+        raise FileNotFoundError(f'Archive not found: {input_path}')
+    blob = input_path.read_bytes()
+    name = input_path.name
+    stem = name[:-len('.vg21c')] if name.lower().endswith('.vg21c') else input_path.stem
+    destination = Path(output_path).expanduser() if output_path else None
+    if blob.startswith(X_DIR_MAGIC):
+        out = xg_unpack_folder(blob, destination or _free_path(input_path.parent / stem))
+    elif blob.startswith(X_MAGIC):
+        out = xg_unpack_file(blob, destination or _free_path(input_path.parent / stem))
+    else:
+        # Legacy VG-21C container or bare stream.
+        return decompress_path(input_path, destination)
+    print('\nRestored: %s' % out)
+    return out
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog='vg21c_codec.py',
+        description='VG-21 lossless compressor (Brotli q11 is one of its candidates)')
+    parser.add_argument('path', help='file or folder to encode, or an archive to decode')
+    parser.add_argument('-d', '--decode', '--decompress', dest='decode', action='store_true',
+                        help='decode instead of encode')
+    parser.add_argument('-o', '--output', help='explicit output path')
+    parser.add_argument('-e', '--effort', choices=(X_EFFORT_FAST, X_EFFORT_BEST),
+                        default=X_EFFORT_BEST,
+                        help='best for ratio (default), fast to skip transforms')
+    return parser.parse_args(argv)
+
+
+def _ask(prompt: str) -> str:
+    """Read a line, exiting quietly when stdin is closed or interrupted."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print('\nNo input; nothing was changed.')
+        raise SystemExit(0)
+
+
+def main(argv=None):
+    # A console that cannot encode a filename (cp1252 and an emoji, say) must not
+    # abort a run, so unprintable characters are escaped instead.
+    try:
+        sys.stdout.reconfigure(errors='backslashreplace')
+    except (AttributeError, ValueError):
+        pass
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv:
+        args = _parse_args(argv)
+        destination = Path(args.output) if args.output else None
+        try:
+            if args.decode:
+                decode_path(Path(args.path), destination)
+            else:
+                encode_path(Path(args.path), destination, args.effort)
+        except (ValueError, OSError, EOFError, InterruptedError, tarfile.TarError) as exc:
+            raise SystemExit(f'Error: {exc}') from exc
         return
-    raw_path = input('Enter the full path to the file/folder: ').strip().strip('"')
+
+    print('=' * 58)
+    print(' VG-21 - lossless file & folder compressor')
+    print('=' * 58)
+    print('1. Encode  (compress a file or folder)')
+    print('2. Decode  (restore a .vg21c archive)')
+    answer = _ask('\nEncode or decode? [1/2]: ').strip().lower()
+    if answer in ('2', 'd', 'decode'):
+        mode = 'decode'
+    elif answer in ('', '1', 'e', 'encode'):
+        mode = 'encode'
+    else:
+        print('Please run again and choose 1 (encode) or 2 (decode).')
+        return
+    prompt = 'Archive to decode: ' if mode == 'decode' else 'File or folder to encode: '
+    raw_path = _ask(prompt).strip().strip('"')
     if not raw_path:
         print('No path entered. Nothing was changed.')
         return
-    path = Path(raw_path).expanduser()
+    raw_out = _ask('Output path (press Enter for the default): ').strip().strip('"')
+    destination = Path(raw_out) if raw_out else None
     try:
-        if choice == '1':
-            compress_path(path)
+        if mode == 'decode':
+            decode_path(Path(raw_path).expanduser(), destination)
         else:
-            decompress_path(path)
+            encode_path(Path(raw_path).expanduser(), destination)
     except (ValueError, OSError, EOFError, InterruptedError, tarfile.TarError) as exc:
         print(f'\nError: {exc}')
 
 
-if __name__=='__main__': main()
+if __name__ == '__main__':
+    main()

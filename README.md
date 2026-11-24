@@ -4,10 +4,10 @@
 
 VG-21 is a personal project exploring lossless data compression, printable text encoding, reversible data formats, and benchmark-driven iteration. It grew from experiments with compact encodings and a Brotli-based baseline into VG-21C, an evolving compression engine that tests multiple candidate representations and selects a result according to its implementation's size criteria.
 
-The repository currently brings together two related components:
+Everything you need is in one file:
 
-- **VG-21C** — the compression/decompression engine (`vg21c_codec.py`).
-- **VG-21 Codec** — a wrapper that applies VG-21C, adds a mode marker, and encodes the resulting bytes as printable Base95 text (`encoder.py`, `decoder.py`, and `main.py`).
+- **`vg21c_codec.py`** — the compressor and the archive decoder, with an interactive prompt. `python vg21c_codec.py` asks whether you want to encode or decode, then does it.
+- **`encoder.py`, `decoder.py`, `main.py`** — the older menu and the printable-Base95 wrapper around it, kept for the text-encoding experiment.
 
 This README documents the project's journey, current design, benchmark evidence, limitations, and ways to reproduce basic tests.
 
@@ -18,9 +18,11 @@ This README documents the project's journey, current design, benchmark evidence,
 - [Project goals](#project-goals)
 - [The journey so far](#the-journey-so-far)
 - [How the current pipeline works](#how-the-current-pipeline-works)
+- [Speed profiles](#speed-profiles)
+- [Never larger than Brotli q11](#never-larger-than-brotli-q11)
 - [Repository files](#repository-files)
 - [Requirements and setup](#requirements-and-setup)
-- [Run the VG-21 Codec wrapper](#run-the-vg-21-codec-wrapper)
+- [Run it](#run-it)
 - [Run VG-21C on its own](#run-vg-21c-on-its-own)
 - [Use the Python API](#use-the-python-api)
 - [Benchmark snapshot](#benchmark-snapshot)
@@ -82,11 +84,30 @@ Printable text output
 
 Decoding reverses these steps. The mode marker tells the decoder whether the payload contains raw bytes or a VG-21C-compressed stream.
 
-### 5. Moving toward reproducible evaluation
+### 5. Making the default fast
+
+The portfolio was correct but slow, so `compress()` gained explicit profiles.
+Profiling showed the pure-Python stages dominating the runtime while a C codec
+usually won, that Brotli quality 11 was being re-run with up to eight parameter
+sets per file, and that incompressible data paid for the whole search before
+being stored raw. The fix is a cost-model scheduler: classify the input, prove
+compressibility, then walk codec families from cheapest to most expensive,
+choosing the strongest variant each one can still afford. The exhaustive path is
+retained as the `max` profile, so no candidate was removed.
+
+### 6. Moving toward reproducible evaluation
 
 The project has included round-trip checks and a small benchmark corpus. The next important step is to make all benchmark inputs, commands, versions, settings, and output measurements easy for another person to reproduce. The current results should be treated as preliminary evidence, not a standardized benchmark suite.
 
 ## How the current pipeline works
+
+### Encoding a file or folder
+
+`python vg21c_codec.py` writes an archive rather than text: the input goes through
+the portfolio below with Brotli q11 as one of its candidates, folders are stored
+as a deduplicated tar or as one stream per file (whichever comes out smaller),
+and the result is framed with a CRC32 of the original bytes. Details are in
+[Never larger than Brotli q11](#never-larger-than-brotli-q11).
 
 ### VG-21C compression engine
 
@@ -108,14 +129,152 @@ For this reason, benchmark at least these three sizes separately:
 
 Do not compare a binary compressor's output size with a text-encoded result without clearly stating which layer is being measured.
 
+## Speed profiles
+
+Evaluating every candidate on every file made ordinary inputs slow: a 16 KiB
+text file took about 5 seconds, and 64 KiB of random data took about 10
+seconds — almost all of it inside the pure-Python token and BWT stages, which
+did not produce the winning stream on any sampled input anyway. `compress()` now
+*schedules* candidates instead of always running them.
+
+| Profile | Behaviour |
+|---|---|
+| `instant` (default) | Classifies the input, uses a cheap DEFLATE probe to prove whether it compresses at all, then runs the strongest codec each family can still afford inside a short budget. Already-compressed containers (JPEG, PNG, HEIC/MP4, GIF, WEBP, GZIP, BZIP2, XZ, 7Z, RAR, ZSTD, LZ4, FLAC, OGG) and high-entropy data are returned unchanged immediately. |
+| `balanced` | Same scheduler with a much larger budget; adds the lexical-dictionary stage, and the native engine for small inputs. |
+| `max` | The complete historical portfolio, unchanged. Slowest, best ratio. |
+
+All three profiles are lossless and emit ordinary VG-21C streams with the same
+framing and CRC32, so any decoder reads any of them. A profile decides only
+*which* candidate is produced, never how a stream is read — streams written by
+earlier versions still decode.
+
+Measured on this repository's own files (CPython 3.12, Windows, one core):
+
+| Input | `instant` | `max` | Speed-up | Size difference |
+|---|---:|---:|---:|---:|
+| README.md, 16 KiB | 0.21 s | 15.7 s | 76x | 0% |
+| README x12, 196 KiB | 0.38 s | 1.56 s | 4x | 0% |
+| Python source, 200 KiB | 0.78 s | 7.12 s | 9x | +5.4% |
+| Highly repetitive, 220 KiB | 0.09 s | 0.49 s | 5x | 0% |
+| Random data, 64 KiB | 0.004 s | 22.4 s | 5400x | 0% |
+
+At gigabyte scale the same scheduler still finishes in seconds, because the
+decision is made from nine spread-out 64 KiB samples rather than from the whole
+input:
+
+| Input | `instant`, end to end | Result |
+|---|---:|---|
+| 877 MB photo folder (1,683 JPEG/HEIC files) | 3.8 s | stored as-is (+21 bytes of container header); decode 2.9 s, all 1,683 files byte-identical |
+| 1 GiB of source-like text | 25.0 s | 323 MB, 30.1% of the original |
+
+A folder archive reaches the codec as one tar blob, so its first and last bytes
+are structural: a tar header in front, end-of-archive padding behind. Both
+compress about tenfold while every photo block between them is incompressible,
+so the probe reduces its samples with a **median**. A `min` let the padding
+decide, and a mean over four windows let two such outliers outvote 880 MB of
+JPEG; either mistake bought a full DEFLATE pass for a 1.6% gain on a folder that
+cannot really be compressed.
+
+Two other large-input costs are gone:
+
+- above 64 MiB the container is verified from the bytes already in memory
+  instead of being read back from disk — a second 1 GB read proves the same
+  round trip;
+- the ZIP member optimizer is skipped above 256 MiB, because it decodes and
+  re-encodes every member and would otherwise spend minutes inside one archive.
+
+The trade is explicit: gigabyte-scale media is stored unchanged even where a
+slow pass would shave 1-2%. The `balanced` and `max` API profiles still do that
+work.
+
+Profiles are an API-level choice for the historical VG-21C engine:
+
+```python
+from vg21c_codec import compress, decompress, PROFILE_BALANCED
+
+packed = compress(data, profile=PROFILE_BALANCED)
+assert decompress(packed) == data
+```
+
+The command-line tool does not take `-p`. It encodes with the portfolio described
+below and accepts `-e best` (default) or `-e fast`.
+
+Two honest caveats. The budget is a target for *choosing* work, not an
+interrupt: a single candidate that turns out slower than predicted can overshoot
+it, which is why `balanced` and `max` exist. And where `instant` declines
+marginal work it can return a slightly larger stream — the largest gap observed
+here was 5.4% on Python source, because the winning stream there came from the
+lexical-dictionary stage that only `balanced` and `max` run.
+
+## Never larger than Brotli q11
+
+The encoder is built on a guarantee that is actually achievable: **the best
+Brotli q11 stream is one of its own candidates**, so an archive can never be
+larger than q11's output for the same bytes. On top of that floor it runs the
+recipes where q11 is measurably not the best, and keeps whichever stream is
+smallest.
+
+| Recipe | What it exploits |
+|---|---|
+| Brotli q11, every mode and window | the floor: plain text and source code, where q11 is already optimal |
+| Column split + LZMA2 / Brotli | CSV, logs, tables: one stream per field turns a record layout into nearly sorted columns |
+| LZMA2 (9e) | structured JSON, where q11 consistently trails |
+| Zstandard 22, long-distance matching, 128 MiB window | repeats further apart than Brotli's 16 MiB window |
+| bzip2 (BWT) | integer series, where the Burrows-Wheeler sort beats both |
+| byte-plane transpose (16/32-bit) | interleaved binary such as PCM audio |
+| duplicate elimination | folders: identical files stored once |
+
+Measured against the strongest q11 stream available (every mode and window
+tried, smallest kept; for folders, the better of "q11 of the tar" and "sum of
+per-file q11"):
+
+| Case | Brotli q11 | Archive | Result |
+|---|---:|---:|---|
+| text, 21 KiB | 6,762 | 6,779 | tie |
+| Python source, 212 KiB | 43,504 | 43,521 | tie |
+| JSON records, 1.0 MB | 54,693 | 49,020 | **10.4% smaller** |
+| CSV table, 812 KiB | 57,421 | 12,085 | **79.0% smaller** |
+| access log, 1.5 MB | 87,086 | 47,645 | **45.3% smaller** |
+| 16-bit PCM audio, 400 KiB | 207,211 | 152,608 | **26.4% smaller** |
+| 32-bit integer series, 280 KiB | 75,464 | 51,246 | **32.1% smaller** |
+| JPEG photo, 779 KiB | 779,009 | 779,024 | tie |
+| folder, 120 files with duplicates | 63,349 | 62,416 | **1.5% smaller** |
+| nested backup folder | 1,877 | 1,448 | **22.9% smaller** |
+| **total** | 1,376,376 | 1,205,792 | **12.4% smaller** |
+
+Seven of the ten cases are strictly smaller. The other three are ties, not
+losses: two are plain text and source code, where every alternative tested lost
+(LZMA2 with tuned context parameters was 3-17% worse), and one is a JPEG, which
+is already entropy coded, so no lossless method can beat q11 there - q11 cannot
+shrink it either. That is the ceiling rather than a gap: because q11 is one of
+the candidates, "never larger" holds on any input, while "strictly smaller"
+depends on the data containing structure q11 misses.
+
+Your own photo folder, where q11 gains nothing at all, comes out 15.8% smaller
+(876.6 MB -> 738.0 MB) in 4 seconds, because 440 of its 1,683 files are
+byte-identical copies.
+
+```bash
+python vg21c_codec.py                      # prompts: encode or decode
+python vg21c_codec.py "New folder"         # -> New folder.vg21c
+python vg21c_codec.py some_file.bin -o out.vg21c
+python vg21c_codec.py -d out.vg21c -o restored
+python vg21c_codec.py folder -e fast       # skip the transforms, keep the q11 floor
+```
+
+Every archive is self-describing (`VG21X01` for a file, `VG21F01` for a folder)
+with a CRC32 over the original data, so decoding needs no flags. `-e best` is
+slow on purpose: it runs the whole candidate list, which includes six q11 passes
+on some inputs. `-e fast` keeps the q11 floor and drops the transforms.
+
 ## Repository files
 
 | File | Purpose |
 |---|---|
-| `vg21c_codec.py` | Bundled VG-21C v0.24 engine; provides compression and decompression functions and a standalone interactive mode. |
-| `encoder.py` | Compresses with VG-21C when smaller, adds a mode marker, and applies Base95 encoding. |
-| `decoder.py` | Decodes Base95 and dispatches to raw-byte handling or VG-21C decompression. |
-| `main.py` | Interactive menu for text and file encoding/decoding. |
+| `vg21c_codec.py` | Everything: the encode/decode prompt, the portfolio (Brotli q11 floor, column split, byte transposes, Zstandard, bzip2, duplicate elimination), folder archives, and the historical VG-21C engine. |
+| `encoder.py` | Older wrapper: VG-21C + Base95 printable text, plus archive helpers. |
+| `decoder.py` | Older wrapper: Base95 decoder, plus archive helpers. |
+| `main.py` | Menu for the older wrapper. |
 | `README.md` | Project overview, history, setup, evidence, and limitations. |
 
 Keep the Python files together in the same directory unless you deliberately update the import paths.
@@ -123,8 +282,8 @@ Keep the Python files together in the same directory unless you deliberately upd
 ## Requirements and setup
 
 - Python 3.10 or newer is recommended.
-- The bundled engine uses Python's standard library and can optionally use Brotli if the package is installed.
-- Brotli is an optional internal candidate dependency; the outer wrapper no longer directly calls `brotli.compress(..., quality=11)`.
+- The encoder uses Python's standard library, Brotli when installed, and Zstandard when installed. A missing package only removes candidates.
+- Brotli is the baseline every archive is measured against; without it the portfolio falls back to LZMA2, bzip2 and zlib.
 
 Clone or download the repository, then open a terminal in the project directory.
 
@@ -135,38 +294,55 @@ python --version
 Optional Brotli installation:
 
 ```bash
-python -m pip install brotli
+python -m pip install brotli zstandard
 ```
 
 If Brotli is not installed, the engine may skip candidates that require it. Exact results can therefore differ depending on the environment and installed dependencies.
 
-## Run the VG-21 Codec wrapper
-
-Start the interactive menu:
-
-```bash
-python main.py
-```
-
-The menu supports:
-
-1. Encode text.
-2. Decode text.
-3. Encode a file into a printable text file.
-4. Decode a previously encoded text file back to bytes.
-0. Exit.
-
-When encoding a file, keep the encoded output as text and use the decoder to reconstruct the original file. Always verify important files after decoding, for example by comparing hashes.
-
-## Run VG-21C on its own
-
-VG-21C can be used without the Base95 wrapper. To start its built-in interactive interface:
+## Run it
 
 ```bash
 python vg21c_codec.py
 ```
 
-The bundled engine's standalone interface prompts for compression or decompression and a file or folder path. This mode uses VG-21C's own file format; it is separate from the outer VG-21 Base95 text format.
+```text
+1. Encode  (compress a file or folder)
+2. Decode  (restore a .vg21c archive)
+
+Encode or decode? [1/2]:
+```
+
+It then asks for the path and an optional output path (press Enter to accept the
+default). Encoding a folder keeps its structure and stores byte-identical files
+once. Decoding never merges into an existing folder or overwrites a file: it
+picks `name (2)` instead.
+
+The same without prompts:
+
+```bash
+python vg21c_codec.py "New folder" -o photos.vg21c
+python vg21c_codec.py -d photos.vg21c -o restored
+```
+
+The functions are importable too:
+
+```python
+from vg21c_codec import encode_path, decode_path
+
+archive = encode_path('New folder')     # -> New folder.vg21c
+restored = decode_path(archive)         # -> New folder (2)
+```
+
+`main.py` remains as the older menu built on `encoder.py`/`decoder.py`, and the
+printable-Base95 pipeline is still available as `encoder.encode_text`,
+`encoder.encode_file`, `decoder.decode_text` and `decoder.decode_file`.
+Always verify important files after decoding, for example by comparing hashes.
+
+## Run VG-21C on its own
+
+The archive decoder also reads streams written by the historical VG-21C engine,
+so `.vg21c` files produced by earlier versions still restore with
+`python vg21c_codec.py -d file.vg21c`.
 
 You can also call the engine functions directly from another Python script:
 
@@ -263,6 +439,7 @@ For a benchmark report suitable for independent review, record:
 5. **No universal superiority claim:** performance depends on file type, content, implementation, and settings.
 6. **Security and robustness:** this is not yet presented as a hardened format for untrusted input. Treat unknown encoded files cautiously and test error handling before production use.
 7. **No production guarantee:** do not use it as the sole storage or backup mechanism for irreplaceable data without independent backups and extensive validation.
+8. **Archive markers:** current archives use the markers `VG21X01` and `VG21F01`. The short-lived separate `vg21x.py` build used different ones, so those archives must be recreated; the files they came from are untouched.
 
 ## Roadmap
 

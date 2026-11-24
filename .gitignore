@@ -43,3 +43,8 @@ Desktop.ini
 # Local benchmark output (keep published results in benchmarks/results/)
 benchmark_output/
 brot.py
+
+# Generated archives and large local data
+*.vg21c
+*.v21x
+New folder/
